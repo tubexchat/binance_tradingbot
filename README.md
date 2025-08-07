@@ -373,23 +373,3 @@ python3 -c "from main import AutoTradingBot; bot = AutoTradingBot(); bot.debug_b
 # 查看资金费率
 python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); api.debug_funding_rates()"
 ```
-
-## 📄 许可证
-
-本项目采用 MIT 许可证。详情请参阅 [LICENSE](LICENSE) 文件。
-
-## 🤝 贡献
-
-欢迎提交Issue和Pull Request来改进这个项目。
-
-## 📞 支持
-
-如果您在使用过程中遇到问题，请：
-
-1. 查看本README的故障排除部分
-2. 检查日志文件中的错误信息
-3. 提交Issue描述具体问题
-
----
-
-⚡ **记住：投资有风险，入市需谨慎！**
