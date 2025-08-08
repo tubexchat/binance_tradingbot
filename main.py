@@ -538,6 +538,43 @@ class AutoTradingBot:
         
         return self.blacklist
 
+    def check_hourly_funding(self, symbol: str) -> bool:
+        """
+        检查合约是否有1小时资金费率结算
+        参考binance-py-monitor的逻辑，检查历史资金费率间隔是否存在1小时（0.8-1.2小时容错范围）
+        """
+        try:
+            import requests
+            # 获取历史资金费率数据（最近4次，确保有足够数据分析间隔）
+            url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=4"
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            funding_history_data = response.json()
+
+            if funding_history_data and len(funding_history_data) >= 2:
+                # 分析相邻交割之间的时间间隔
+                for i in range(len(funding_history_data) - 1):
+                    current_funding_time = funding_history_data[i]["fundingTime"]
+                    next_funding_time = funding_history_data[i + 1]["fundingTime"]
+
+                    # 计算时间间隔（小时）
+                    interval_hours = (next_funding_time - current_funding_time) / (1000 * 3600)
+
+                    # 检查是否存在大约1小时的交割间隔（容错范围：0.8-1.2小时）
+                    if 0.8 <= interval_hours <= 1.2:
+                        logging.debug(f"{symbol} 发现1小时资金费率结算，间隔: {interval_hours:.1f}h")
+                        return True
+
+                logging.debug(f"{symbol} 未发现1小时资金费率结算")
+                return False
+            else:
+                logging.debug(f"{symbol} 历史资金费率数据不足")
+                return False
+
+        except Exception as e:
+            logging.debug(f"检查 {symbol} 1小时资金费率结算失败: {e}")
+            return False
+
     def get_long_candidates(self) -> List[str]:
         """
         获取做多候选合约列表
@@ -548,9 +585,10 @@ class AutoTradingBot:
         4. MACD日级慢线大于0
         5. 多空比小于1
         6. 24小时涨幅大于0
+        7. 资金费率结算时间为1小时
         """
         candidates = []
-        
+
         try:
             # 获取所有合约的资金费率
             logging.info("开始筛选做多候选合约...")
@@ -558,13 +596,13 @@ class AutoTradingBot:
             if not funding_rates:
                 logging.warning("未能获取资金费率数据")
                 return candidates
-            
+
             # 获取24小时交易统计
             ticker_24hr = self.api.get_24hr_ticker()
             if not ticker_24hr:
                 logging.warning("未能获取24小时交易统计")
                 return candidates
-            
+
             # 创建交易量映射表和涨幅映射表
             volume_map = {}
             price_change_map = {}
@@ -574,46 +612,46 @@ class AutoTradingBot:
                 price_change_percent = float(ticker.get('priceChangePercent', 0))
                 volume_map[symbol] = quote_volume
                 price_change_map[symbol] = price_change_percent
-            
+
             # 筛选符合条件的合约
             for data in funding_rates:
                 try:
                     symbol = data.get('symbol', '')
                     if not symbol.endswith('USDT'):
                         continue
-                    
+
                     # 筛选条件0：检查黑名单
                     if symbol in self.blacklist:
                         logging.info(f"❌ {symbol} 在黑名单中，跳过做多")
                         continue
-                    
+
                     funding_rate = float(data.get('lastFundingRate', 0))
-                    
+
                     # 筛选条件1：剔除资金费率为0的合约
                     if funding_rate == 0:
                         continue
-                    
+
                     # 筛选条件2：负资金费率（资金费率 < -0.1%）
                     if funding_rate >= -0.001:  # -0.1%
                         continue
-                    
+
                     # 筛选条件3：24小时交易量大于6000万USDT
                     quote_volume = volume_map.get(symbol, 0)
                     if quote_volume < self.min_volume_usdt:
                         continue
-                    
+
                     # 筛选条件4：MACD日级慢线大于0
                     macd_signal = get_macd_signal_line(self.api, symbol)
                     if macd_signal is None or macd_signal <= 0:
                         continue
-                    
+
                     # 筛选条件5：多空比小于1
                     try:
                         long_short_ratio_data = self.api.get_top_long_short_account_ratio(symbol, period='5m', limit=1)
                         if not long_short_ratio_data or len(long_short_ratio_data) == 0:
                             logging.debug(f"{symbol} 未能获取多空比数据，跳过")
                             continue
-                        
+
                         long_short_ratio = float(long_short_ratio_data[-1].get('longShortRatio', 1))
                         if long_short_ratio >= 1:
                             logging.debug(f"{symbol} 多空比 {long_short_ratio:.3f} >= 1，跳过做多")
@@ -621,23 +659,28 @@ class AutoTradingBot:
                     except Exception as e:
                         logging.debug(f"{symbol} 获取多空比失败: {e}，跳过")
                         continue
-                    
+
                     # 筛选条件6：24小时涨幅大于0
                     price_change_percent = price_change_map.get(symbol, 0)
                     if price_change_percent <= 0:
                         logging.debug(f"{symbol} 24h涨幅 {price_change_percent:.3f}% <= 0，跳过做多")
                         continue
-                    
+
+                    # 筛选条件7：资金费率结算时间为1小时
+                    if not self.check_hourly_funding(symbol):
+                        logging.debug(f"{symbol} 资金费率结算时间不是1小时，跳过做多")
+                        continue
+
                     candidates.append(symbol)
-                    logging.info(f"✅ 做多候选: {symbol}, 资金费率: {funding_rate:.6f}, 24h成交量: {quote_volume/1e8:.2f}亿USDT, MACD慢线: {macd_signal:.6f}, 多空比: {long_short_ratio:.3f}, 24h涨幅: {price_change_percent:.3f}%")
-                    
+                    logging.info(f"✅ 做多候选: {symbol}, 资金费率: {funding_rate:.6f}, 24h成交量: {quote_volume/1e8:.2f}亿USDT, MACD慢线: {macd_signal:.6f}, 多空比: {long_short_ratio:.3f}, 24h涨幅: {price_change_percent:.3f}%, 1小时结算: ✓")
+
                 except Exception as e:
                     logging.error(f"处理合约 {symbol} 时出错: {e}")
                     continue
-            
+
             logging.info(f"筛选完成，共找到 {len(candidates)} 个做多候选合约")
             return candidates
-            
+
         except Exception as e:
             logging.error(f"获取做多候选合约失败: {e}")
             return candidates
@@ -741,84 +784,112 @@ class AutoTradingBot:
             logging.error(f"执行 {symbol} 做多订单失败: {e}")
             return False
 
+    def check_position_conditions(self, symbol: str) -> tuple[bool, str]:
+        """
+        检查持仓合约是否符合交易条件
+        返回: (是否符合条件, 不符合的原因)
+        """
+        try:
+            # 获取当前资金费率
+            funding_data = self.api.get_symbol_funding_rate(symbol)
+            if not funding_data:
+                return False, "无法获取资金费率数据"
+
+            funding_rate = float(funding_data.get('lastFundingRate', 0))
+
+            # 条件1：资金费率必须为负且小于-0.1%
+            if funding_rate >= -0.001:  # -0.1%
+                return False, f"资金费率不符合({funding_rate:.6f} >= -0.1%)"
+
+            # 条件2：24小时涨幅必须大于0
+            ticker_24hr = self.api.get_24hr_ticker()
+            if ticker_24hr:
+                for ticker in ticker_24hr:
+                    if ticker.get('symbol') == symbol:
+                        price_change_percent = float(ticker.get('priceChangePercent', 0))
+                        if price_change_percent <= 0:
+                            return False, f"24h涨幅不符合({price_change_percent:.3f}% <= 0)"
+                        break
+                else:
+                    return False, "无法获取24小时涨跌幅数据"
+            else:
+                return False, "无法获取24小时交易统计"
+
+            # 条件3：资金费率结算时间必须为1小时
+            if not self.check_hourly_funding(symbol):
+                return False, "资金费率结算时间不是1小时"
+
+            return True, "符合所有条件"
+
+        except Exception as e:
+            return False, f"检查条件时出错: {e}"
+
     def check_and_close_positions(self):
-        """检查并平仓（新策略：资金费率>-0.1%时自动平仓）"""
+        """检查并平仓（新策略：当持仓合约不符合条件时自动平仓）"""
         try:
             logging.info("开始检查需要平仓的持仓...")
-            
+
             # 获取所有持仓
             positions = self.api.get_positions()
             if not positions:
                 logging.debug("未获取到持仓信息")
                 return
-            
+
             # 过滤有效持仓
             active_positions = []
             for position in positions:
                 position_amt = float(position.get('positionAmt', 0))
                 if abs(position_amt) > 0:
                     active_positions.append(position)
-            
+
             if not active_positions:
                 logging.debug("当前没有持仓")
                 return
-            
+
             logging.info(f"当前有 {len(active_positions)} 个持仓")
-            
-            # 检查每个持仓的资金费率
+
+            # 检查每个持仓是否符合条件
             for position in active_positions:
                 try:
                     symbol = position.get('symbol', '')
                     position_amt = float(position.get('positionAmt', 0))
                     unrealized_pnl = float(position.get('unRealizedProfit', 0))
-                    
+
                     logging.info(f"{symbol} 持仓量: {position_amt}, 未实现盈亏: {unrealized_pnl:.4f} USDT")
-                    
-                    # 📝 只平仓多头仓位，跳过空头仓位
+
+                    # 📝 只检查多头仓位，跳过空头仓位
                     if position_amt < 0:
-                        logging.info(f"🔴 {symbol} 为空头仓位，跳过平仓操作")
+                        logging.info(f"🔴 {symbol} 为空头仓位，跳过检查")
                         continue
-                    
-                    # 获取当前资金费率
-                    try:
-                        funding_data = self.api.get_symbol_funding_rate(symbol)
-                        if not funding_data:
-                            logging.warning(f"无法获取 {symbol} 的资金费率数据")
-                            continue
-                        
-                        funding_rate = float(funding_data.get('lastFundingRate', 0))
-                        logging.info(f"{symbol} 当前资金费率: {funding_rate:.6f}")
-                        
-                        # 平仓条件：资金费率 > -0.1%
-                        if funding_rate > -0.001:  # -0.1%
-                            logging.warning(f"🚨 {symbol} 资金费率上升至 ({funding_rate:.6f} > -0.1%)，准备平仓")
-                            
-                            # 检查是否在黑名单中
-                            if symbol in self.blacklist:
-                                logging.warning(f"🚨 {symbol} 在黑名单中且资金费率转正，强制平仓")
-                            
-                            try:
-                                result = self.api.close_position(symbol)
-                                logging.info(f"✅ 成功平仓 {symbol}: {result}")
-                                
-                                # 记录平仓信息
-                                logging.info(f"📊 平仓详情 - 交易对: {symbol}, 持仓量: {position_amt}, 未实现盈亏: {unrealized_pnl:.4f} USDT, 平仓原因: 资金费率上升至 ({funding_rate:.6f} > -0.1%)")
-                                
-                            except Exception as e:
-                                logging.error(f"❌ 平仓 {symbol} 失败: {e}")
-                        else:
-                            logging.debug(f"{symbol} 资金费率仍低于阈值 ({funding_rate:.6f} <= -0.1%)，保持持仓")
-                            
-                    except Exception as e:
-                        logging.error(f"获取 {symbol} 资金费率失败: {e}")
-                        continue
-                        
+
+                    # 检查持仓合约是否符合交易条件
+                    is_valid, reason = self.check_position_conditions(symbol)
+
+                    if not is_valid:
+                        logging.warning(f"🚨 {symbol} 不符合持仓条件: {reason}，准备平仓")
+
+                        # 检查是否在黑名单中
+                        if symbol in self.blacklist:
+                            logging.warning(f"🚨 {symbol} 在黑名单中且不符合条件，强制平仓")
+
+                        try:
+                            result = self.api.close_position(symbol)
+                            logging.info(f"✅ 成功平仓 {symbol}: {result}")
+
+                            # 记录平仓信息
+                            logging.info(f"📊 平仓详情 - 交易对: {symbol}, 持仓量: {position_amt}, 未实现盈亏: {unrealized_pnl:.4f} USDT, 平仓原因: {reason}")
+
+                        except Exception as e:
+                            logging.error(f"❌ 平仓 {symbol} 失败: {e}")
+                    else:
+                        logging.debug(f"{symbol} 符合持仓条件，保持持仓")
+
                 except Exception as e:
                     logging.error(f"处理持仓 {symbol} 时出错: {e}")
                     continue
-                    
+
         except Exception as e:
-            logging.error(f"检查平仓条件失败: {e}")
+            logging.error(f"检查和平仓过程失败: {e}")
 
     def scan_and_trade(self):
         """扫描并执行做多交易（基于负资金费率+MACD+多空比策略）"""
