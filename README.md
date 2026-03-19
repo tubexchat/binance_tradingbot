@@ -1,379 +1,381 @@
-# 🤖 Binance AI Trading Bot
+# Binance AI Trading Bot
 
-一个基于负资金费率套利策略的币安合约自动化交易机器人，采用多指标融合分析，支持24/7不间断自动交易。
+An automated Binance Futures trading bot based on negative funding rate arbitrage strategy, featuring multi-indicator analysis and 24/7 unattended trading.
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Binance](https://img.shields.io/badge/Exchange-Binance_Futures-yellow.svg)](https://binance.com)
 
-## 📋 目录
+[中文文档](README-CN.md)
 
-- [项目介绍](#项目介绍)
-- [交易策略](#交易策略)
-- [核心功能](#核心功能)
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [使用方法](#使用方法)
-- [项目结构](#项目结构)
-- [监控管理](#监控管理)
-- [风险提示](#风险提示)
-- [故障排除](#故障排除)
+## Table of Contents
 
-## 🎯 项目介绍
+- [Overview](#overview)
+- [Trading Strategy](#trading-strategy)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Project Structure](#project-structure)
+- [Monitoring](#monitoring)
+- [Risk Disclaimer](#risk-disclaimer)
+- [Troubleshooting](#troubleshooting)
 
-这是一个专为币安合约市场设计的智能交易机器人，主要利用负资金费率进行套利交易。机器人采用多指标综合分析，包括资金费率、MACD、多空比和成交量等，实现全自动化的开仓和平仓操作。
+## Overview
 
-### 核心特性
+A smart trading bot designed for the Binance Futures market, primarily leveraging negative funding rate arbitrage. The bot uses comprehensive multi-indicator analysis — including funding rate, MACD, long/short ratio, and volume — to execute fully automated position opening and closing.
 
-- 🎯 **负资金费率套利**: 专注于负资金费率机会，获取资金费用收益
-- 🔄 **全自动交易**: 自动扫描、开仓、平仓，无需人工干预
-- 📊 **多指标分析**: 结合MACD、多空比、成交量等多个指标
-- 🛡️ **风险控制**: 智能止损、黑名单、杠杆控制等安全机制
-- 📈 **实时监控**: 完整的账户和持仓监控系统
-- 🔧 **灵活配置**: 支持环境变量和命令行参数配置
-- 🚀 **后台运行**: 支持nohup后台运行，SSH断开后继续工作
+### Key Features
 
-## 📊 交易策略
+- **Negative Funding Rate Arbitrage**: Captures funding fee income from negative funding rates
+- **Fully Automated**: Auto-scanning, position opening/closing with zero manual intervention
+- **Multi-Indicator Analysis**: Combines MACD, long/short ratio, volume and more
+- **Risk Control**: Smart stop-loss, blacklist filtering, leverage management
+- **Real-time Monitoring**: Complete account and position monitoring system
+- **Flexible Configuration**: Supports environment variables and command-line arguments
+- **Background Execution**: Supports nohup for persistent background operation
 
-### 做多开仓条件（需同时满足）
+## Trading Strategy
 
-```
-✅ 资金费率 < -0.1%（负资金费率）
-✅ 24小时交易量 > 6000万 USDT
-✅ MACD日级慢线 > 0（日线趋势向上）
-✅ 多空比 < 1（空头占优势）
-✅ 24小时涨跌幅 > 0（当日上涨）
-✅ 资金费率结算时间为1小时（高频结算）
-✅ 剔除资金费率为0的合约
-```
-
-### 平仓条件
+### Long Entry Conditions (All Must Be Met)
 
 ```
-📈 当持仓合约不符合开仓条件时自动平仓：
-   • 资金费率 ≥ -0.1%（负资金费率减弱或转正）
-   • 24小时涨跌幅 ≤ 0（转为下跌）
-   • 资金费率结算时间不再是1小时
-⏰ 独立监控线程每5分钟检查一次持仓
-🔄 自动平仓，无需人工干预
+- Funding rate < -0.1% (negative funding rate)
+- 24h trading volume > 60M USDT
+- MACD daily slow line > 0 (daily uptrend)
+- Long/short ratio < 1 (shorts dominant)
+- 24h price change > 0 (positive daily movement)
+- Funding rate settlement interval = 1 hour (high-frequency settlement)
+- Excludes contracts with 0 funding rate
 ```
 
-### 策略逻辑
+### Exit Conditions
 
-1. **负资金费率套利**: 当资金费率为负时，做多可以获得资金费用收益
-2. **多指标筛选**: 确保选择的标的具有良好的技术面和市场结构
-3. **风险控制**: 通过杠杆限制、黑名单等机制控制风险
-4. **动态监控**: 实时监控资金费率变化，及时平仓
+```
+Automatically closes positions when entry conditions are no longer met:
+  - Funding rate >= -0.1% (negative rate weakening or turning positive)
+  - 24h price change <= 0 (turning bearish)
+  - Funding rate settlement interval no longer 1 hour
+Independent monitoring thread checks positions every 5 minutes
+Fully automated — no manual intervention required
+```
 
-## 🚀 核心功能
+### Strategy Logic
 
-### 自动化交易
-- ✅ 负资金费率扫描和筛选
-- ✅ 多指标技术分析（MACD、多空比、成交量）
-- ✅ 自动开仓和平仓
-- ✅ 动态杠杆和保证金管理
-- ✅ 黑名单过滤功能
+1. **Negative Funding Rate Arbitrage**: Going long during negative funding rates earns funding fee income
+2. **Multi-Indicator Screening**: Ensures selected assets have solid technicals and market structure
+3. **Risk Management**: Controls risk through leverage limits, blacklists, and other mechanisms
+4. **Dynamic Monitoring**: Real-time funding rate monitoring with timely position exits
 
-### 账户管理
-- ✅ 实时账户信息查询
-- ✅ 持仓和订单监控
-- ✅ 批量保证金模式设置
-- ✅ 交易历史记录查看
+## Features
 
-### 系统监控
-- ✅ 详细日志记录
-- ✅ 进程状态监控
-- ✅ 实时性能数据
-- ✅ 异常告警和处理
+### Automated Trading
+- Negative funding rate scanning and filtering
+- Multi-indicator technical analysis (MACD, long/short ratio, volume)
+- Automatic position opening and closing
+- Dynamic leverage and margin management
+- Blacklist filtering
 
-## 🛠 快速开始
+### Account Management
+- Real-time account information queries
+- Position and order monitoring
+- Batch margin mode configuration
+- Trade history viewing
 
-### 环境要求
+### System Monitoring
+- Detailed logging
+- Process status monitoring
+- Real-time performance data
+- Exception alerts and handling
+
+## Quick Start
+
+### Requirements
 
 - Python 3.8+
-- 币安合约账户
-- API密钥（需要合约交易权限）
+- Binance Futures account
+- API key (with Futures trading permission)
 
-### 1. 克隆项目
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/your-username/binance-ai-bot.git
 cd binance-ai-bot
 ```
 
-### 2. 安装依赖
+### 2. Install Dependencies
 
 ```bash
 pip3 install -r requirements.txt
 ```
 
-### 3. 配置API密钥
+### 3. Configure API Keys
 
-创建 `.env` 文件：
+Create a `.env` file:
 ```env
-# 币安API配置（必需）
+# Binance API Configuration (Required)
 BINANCE_API_KEY=your_api_key_here
 BINANCE_API_SECRET=your_api_secret_here
 
-# 交易参数（可选）
+# Trading Parameters (Optional)
 TRADE_AMOUNT=100
 LEVERAGE=2
 MONITOR_INTERVAL=300
 POSITION_CHECK_INTERVAL=300
 
-# 黑名单设置（可选）
+# Blacklist Settings (Optional)
 BLACKLIST_SYMBOLS=LUNAUSDT,USTCUSDT
 
-# 测试环境（可选）
+# Testnet (Optional)
 USE_TESTNET=false
 ```
 
-### 4. 设置保证金模式
+### 4. Set Margin Mode
 
 ```bash
-# 首次使用前必须设置为全仓模式
+# Must be run before first use — sets cross margin mode
 python3 setup_margin_modes.py
 ```
 
-### 5. 启动机器人
+### 5. Start the Bot
 
 ```bash
-# 方式一：使用启动脚本（推荐）
+# Option 1: Use the startup script (Recommended)
 ./start_bot.sh
 
-# 方式二：直接运行
+# Option 2: Run directly
 python3 auto_trading_bot.py
 ```
 
-## ⚙️ 配置说明
+## Configuration
 
-### 环境变量配置
+### Environment Variables
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `BINANCE_API_KEY` | - | 币安API密钥（必需） |
-| `BINANCE_API_SECRET` | - | 币安API密钥（必需） |
-| `TRADE_AMOUNT` | 100 | 每次交易金额（USDT） |
-| `LEVERAGE` | 2 | 杠杆倍数 |
-| `MONITOR_INTERVAL` | 300 | 监控间隔（秒） |
-| `POSITION_CHECK_INTERVAL` | 300 | 持仓检查间隔（秒） |
-| `BLACKLIST_SYMBOLS` | - | 黑名单交易对（逗号分隔） |
-| `USE_TESTNET` | false | 是否使用测试网 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BINANCE_API_KEY` | - | Binance API key (required) |
+| `BINANCE_API_SECRET` | - | Binance API secret (required) |
+| `TRADE_AMOUNT` | 100 | Trade amount per order (USDT) |
+| `LEVERAGE` | 2 | Leverage multiplier |
+| `MONITOR_INTERVAL` | 300 | Monitoring interval (seconds) |
+| `POSITION_CHECK_INTERVAL` | 300 | Position check interval (seconds) |
+| `BLACKLIST_SYMBOLS` | - | Blacklisted trading pairs (comma-separated) |
+| `USE_TESTNET` | false | Use testnet environment |
 
-### 命令行参数
+### Command-Line Arguments
 
 ```bash
 python3 auto_trading_bot.py --help
 
-可选参数:
-  --amount AMOUNT       每次交易金额(USDT，默认100)
-  --leverage LEVERAGE   杠杆倍数(默认2)
-  --interval INTERVAL   监控间隔(秒，默认300)
+Options:
+  --amount AMOUNT       Trade amount in USDT (default: 100)
+  --leverage LEVERAGE   Leverage multiplier (default: 2)
+  --interval INTERVAL   Monitoring interval in seconds (default: 300)
   --position-check-interval INTERVAL
-                        持仓检查间隔(秒，默认300)
-  --testnet             使用测试网
+                        Position check interval in seconds (default: 300)
+  --testnet             Use testnet
 ```
 
-## 💻 使用方法
+## Usage
 
-### 方式一：脚本管理（推荐）
+### Option 1: Script Management (Recommended)
 
 ```bash
-# 启动机器人
+# Start the bot
 ./start_bot.sh
 
-# 检查运行状态
+# Check status
 ./check_bot.sh
 
-# 停止机器人
+# Stop the bot
 ./stop_bot.sh
 ```
 
-### 方式二：交互式运行
+### Option 2: Interactive Mode
 
 ```bash
-# 使用默认参数
+# Default parameters
 python3 auto_trading_bot.py
 
-# 自定义参数
+# Custom parameters
 python3 auto_trading_bot.py --amount 50 --leverage 5
 ```
 
-### 方式三：后台运行
+### Option 3: Background Mode
 
 ```bash
-# 使用nohup后台运行
+# Run in background with nohup
 nohup python3 run_auto_trading.py > trading.log 2>&1 &
 ```
 
-### 方式四：账户监控
+### Option 4: Account Monitoring
 
 ```bash
-# 查看账户信息
+# View account info
 python3 main.py
 
-# 调试持仓检查
+# Debug position check
 python3 debug_position_check.py
 ```
 
-## 📁 项目结构
+## Project Structure
 
 ```
 binancebot-long-lewis/
-├── main.py                    # 核心API和交易逻辑
-├── auto_trading_bot.py        # 交互式启动脚本
-├── run_auto_trading.py        # 后台运行脚本
-├── setup_margin_modes.py      # 保证金模式设置工具
-├── debug_position_check.py    # 持仓检查调试工具
-├── start_bot.sh              # 启动脚本
-├── stop_bot.sh               # 停止脚本
-├── check_bot.sh              # 状态检查脚本
-├── requirements.txt          # 依赖列表
-├── .env                      # 环境变量配置
-└── logs/                     # 日志目录
-    ├── bot.pid              # 进程ID文件
-    └── trading_bot_*.log    # 交易日志
+├── main.py                    # Core API and trading logic
+├── auto_trading_bot.py        # Interactive startup script
+├── run_auto_trading.py        # Background execution script
+├── setup_margin_modes.py      # Margin mode setup tool
+├── debug_position_check.py    # Position check debug tool
+├── start_bot.sh              # Start script
+├── stop_bot.sh               # Stop script
+├── check_bot.sh              # Status check script
+├── requirements.txt          # Dependencies
+├── .env                      # Environment configuration
+└── logs/                     # Log directory
+    ├── bot.pid              # Process ID file
+    └── trading_bot_*.log    # Trading logs
 ```
 
-## 📈 监控管理
+## Monitoring
 
-### 实时监控
+### Real-time Monitoring
 
 ```bash
-# 查看实时日志
+# View live logs
 tail -f logs/trading_bot_*.log
 
-# 检查进程状态
+# Check process status
 ./check_bot.sh
 
-# 查看系统进程
+# View system processes
 ps aux | grep python3
 ```
 
-### 日志分析
+### Log Analysis
 
-日志文件包含以下信息：
-- 交易信号和决策过程
-- 开仓和平仓记录
-- 账户余额变化
-- 错误和异常信息
-- 性能统计数据
+Log files contain:
+- Trading signals and decision processes
+- Position open/close records
+- Account balance changes
+- Errors and exceptions
+- Performance statistics
 
-### 性能监控
+### Performance Monitoring
 
 ```bash
-# 查看账户摘要
+# View account summary
 python3 main.py
 
-# 获取持仓信息
+# Get position info
 python3 -c "from main import BinanceAccountMonitor; m = BinanceAccountMonitor(); m.print_positions()"
 ```
 
-## 🔧 API功能
+## API Reference
 
-### BinanceFuturesAPI类
+### BinanceFuturesAPI
 
 ```python
 from main import BinanceFuturesAPI
 
-# 初始化API
+# Initialize API
 api = BinanceFuturesAPI()
 
-# 获取账户信息
+# Account information
 account = api.get_account_info()
 positions = api.get_positions()
 balance = api.get_balance()
 
-# 交易操作
+# Trading operations
 api.place_order(symbol='BTCUSDT', side='BUY', order_type='MARKET', quoteOrderQty=100)
 api.close_position('BTCUSDT')
 api.set_leverage('BTCUSDT', 5)
 
-# 市场数据
+# Market data
 funding_rates = api.get_funding_rates()
 klines = api.get_klines('BTCUSDT', '1d')
 ```
 
-### AutoTradingBot类
+### AutoTradingBot
 
 ```python
 from main import AutoTradingBot
 
-# 初始化交易机器人
+# Initialize trading bot
 bot = AutoTradingBot()
 
-# 设置交易参数
+# Set trading parameters
 bot.trade_amount = 100
 bot.leverage = 5
 
-# 启动监控
+# Start monitoring
 bot.start_monitoring()
 ```
 
-## ⚠️ 风险提示
+## Risk Disclaimer
 
-### 交易风险
+### Trading Risks
 
-- 📊 **市场风险**: 合约交易存在价格波动风险
-- 💰 **杠杆风险**: 杠杆交易会放大盈亏
-- 🔄 **资金费率风险**: 资金费率可能快速变化
-- 📉 **技术风险**: 指标失效或网络问题
+- **Market Risk**: Futures trading involves significant price volatility
+- **Leverage Risk**: Leveraged trading amplifies both gains and losses
+- **Funding Rate Risk**: Funding rates can change rapidly
+- **Technical Risk**: Indicator failures or network issues may occur
 
-### 使用建议
+### Recommendations
 
-1. **小额测试**: 首次使用建议小额测试
-2. **合理杠杆**: 不要使用过高杠杆倍数
-3. **监控止损**: 定期检查持仓和账户状态
-4. **备用方案**: 准备手动止损方案
-5. **资金管理**: 不要投入全部资金
+1. **Start Small**: Test with small amounts first
+2. **Reasonable Leverage**: Avoid excessive leverage
+3. **Monitor Positions**: Regularly check positions and account status
+4. **Have a Backup Plan**: Prepare manual stop-loss procedures
+5. **Money Management**: Never invest more than you can afford to lose
 
-### 免责声明
+### Disclaimer
 
-本项目仅供学习和研究使用，不构成投资建议。使用者需要承担所有交易风险，作者不对任何损失负责。
+This project is for educational and research purposes only and does not constitute investment advice. Users assume all trading risks. The author is not responsible for any losses.
 
-## 🔍 故障排除
+## Troubleshooting
 
-### 常见问题
+### Common Issues
 
-1. **API连接失败**
+1. **API Connection Failed**
    ```bash
-   # 检查API密钥配置
+   # Check API key configuration
    cat .env | grep BINANCE_API
-   
-   # 测试API连接
+
+   # Test API connection
    python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); print(api.get_account_info())"
    ```
 
-2. **保证金模式错误**
+2. **Margin Mode Error**
    ```bash
-   # 重新设置保证金模式
+   # Re-run margin mode setup
    python3 setup_margin_modes.py
    ```
 
-3. **机器人启动失败**
+3. **Bot Startup Failed**
    ```bash
-   # 查看详细日志
+   # View detailed logs
    tail -50 logs/trading_bot_*.log
-   
-   # 检查进程状态
+
+   # Check process status
    ./check_bot.sh
    ```
 
-4. **权限问题**
+4. **Permission Issues**
    ```bash
-   # 添加执行权限
+   # Add execute permissions
    chmod +x *.sh
    ```
 
-### 调试命令
+### Debug Commands
 
 ```bash
-# 测试API连接
-python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); print('API连接成功')"
+# Test API connection
+python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); print('API connection successful')"
 
-# 检查黑名单配置
+# Check blacklist configuration
 python3 -c "from main import AutoTradingBot; bot = AutoTradingBot(); bot.debug_blacklist()"
 
-# 查看资金费率
+# View funding rates
 python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); api.debug_funding_rates()"
 ```
