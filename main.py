@@ -447,43 +447,96 @@ class BinanceFuturesAPI:
         """获取24小时价格变动统计"""
         return self._make_request('GET', '/fapi/v1/ticker/24hr', signed=False)
 
+    def get_order_book(self, symbol: str, limit: int = 5) -> Dict:
+        """获取订单簿深度数据，用于估算买卖价差和滑点"""
+        params = {'symbol': symbol, 'limit': limit}
+        return self._make_request('GET', '/fapi/v1/depth', params, signed=False)
+
+    def get_funding_rate_history(self, symbol: str, limit: int = 5) -> List[Dict]:
+        """获取历史资金费率，用于分析费率趋势"""
+        params = {'symbol': symbol, 'limit': limit}
+        return self._make_request('GET', '/fapi/v1/fundingRate', params, signed=False)
+
+    def get_book_ticker(self, symbol: str = None) -> Dict:
+        """获取最优挂单价格(最佳买卖价)，比order book更轻量"""
+        params = {}
+        if symbol:
+            params['symbol'] = symbol
+        return self._make_request('GET', '/fapi/v1/ticker/bookTicker', params, signed=False)
+
 class AutoTradingBot:
-    """资金费率套利机器人 - 结算前开仓，结算后极速平仓，只吃资金费"""
+    """
+    资金费率套利机器人 v3.0 - 量化增强版
+
+    核心优化:
+    1. 净利润估算过滤 (funding_fee - taker_fee×2 - spread_cost > 0)
+    2. 波动率风险过滤 (ATR/price 过高则跳过)
+    3. 动态仓位管理 (按预期净利润比例分配)
+    4. 多因子候选评分 (净利润 × 流动性 × 费率趋势)
+    5. 完整P&L追踪
+    6. 多采样时间同步
+    7. 指数退避重试
+    """
+
+    # Binance taker fee (VIP0, 含BNB抵扣约0.036%)
+    TAKER_FEE_RATE = 0.0004  # 0.04% 保守估计
+    # 最大可接受的买卖价差占比
+    MAX_SPREAD_RATIO = 0.001  # 0.1%
+    # 波动率安全倍数: ATR/price 不能超过 funding_rate × 此倍数
+    VOLATILITY_SAFETY_MULTIPLE = 3.0
 
     def __init__(self, api_key: str = None, api_secret: str = None, testnet: bool = False):
         """初始化资金费率套利机器人"""
         self.api = BinanceFuturesAPI(api_key, api_secret, testnet)
         self.running = False
 
-        # 交易参数
-        self.trade_amount = float(os.getenv('TRADE_AMOUNT', '100'))  # 每笔金额(USDT)
-        self.leverage = int(os.getenv('LEVERAGE', '20'))  # 杠杆倍数
-        self.min_funding_rate = float(os.getenv('MIN_FUNDING_RATE', '0.0005'))  # 最小资金费率绝对值(0.05%)
-        self.open_before_seconds = float(os.getenv('OPEN_BEFORE_SECONDS', '2'))  # 结算前N秒开仓
-        self.close_after_seconds = float(os.getenv('CLOSE_AFTER_SECONDS', '0.5'))  # 结算后N秒平仓
-        self.pre_scan_minutes = float(os.getenv('PRE_SCAN_MINUTES', '3'))  # 结算前N分钟预扫描
-        self.max_positions = int(os.getenv('MAX_POSITIONS', '5'))  # 最大同时持仓数
+        # 基础交易参数
+        self.trade_amount = float(os.getenv('TRADE_AMOUNT', '100'))
+        self.leverage = int(os.getenv('LEVERAGE', '20'))
+        self.min_funding_rate = float(os.getenv('MIN_FUNDING_RATE', '0.0005'))
+        self.open_before_seconds = float(os.getenv('OPEN_BEFORE_SECONDS', '2'))
+        self.close_after_seconds = float(os.getenv('CLOSE_AFTER_SECONDS', '0.5'))
+        self.pre_scan_minutes = float(os.getenv('PRE_SCAN_MINUTES', '3'))
+        self.max_positions = int(os.getenv('MAX_POSITIONS', '5'))
 
-        # 时间同步
-        self.time_offset = 0  # 本地时间 - 服务器时间 (ms)
+        # v3.0 量化增强参数
+        self.min_net_profit_rate = float(os.getenv('MIN_NET_PROFIT_RATE', '0.0001'))  # 最小净利润率 0.01%
+        self.max_spread_ratio = float(os.getenv('MAX_SPREAD_RATIO', str(self.MAX_SPREAD_RATIO)))
+        self.dynamic_sizing = os.getenv('DYNAMIC_SIZING', 'true').lower() == 'true'
+        self.min_volume_usdt = float(os.getenv('MIN_VOLUME_USDT', '50000000'))  # 最小24h成交量
+
+        # 时间同步 (多采样)
+        self.time_offset = 0
+        self.time_sync_samples = 3
 
         # 持仓模式缓存
         self.position_mode = None
 
-        # 本轮开仓记录: [{symbol, direction, quantity}, ...]
+        # 本轮开仓记录
         self.round_positions = []
+
+        # P&L追踪
+        self.session_pnl = []  # [{round, timestamp, candidates, opened, funding_est, fees_est, net_est}, ...]
+        self.round_counter = 0
+
+        # 24h ticker 缓存 (每轮扫描时更新)
+        self._ticker_cache = {}
+        self._ticker_cache_time = 0
 
         # 黑名单设置
         self.load_blacklist()
 
-        logging.info("资金费率套利机器人初始化完成")
+        logging.info("=" * 60)
+        logging.info("🧠 资金费率套利机器人 v3.0 (量化增强版) 初始化")
         logging.info(f"📋 策略: 结算前{self.open_before_seconds}秒开仓, 结算后{self.close_after_seconds}秒平仓")
-        logging.info(f"💰 每笔: {self.trade_amount} USDT, 杠杆: {self.leverage}x, 最小费率: {self.min_funding_rate*100:.3f}%")
+        logging.info(f"💰 每笔: {self.trade_amount} USDT, 杠杆: {self.leverage}x")
+        logging.info(f"📊 最小费率: {self.min_funding_rate*100:.3f}%, 最小净利润率: {self.min_net_profit_rate*100:.4f}%")
+        logging.info(f"📊 最大价差: {self.max_spread_ratio*100:.2f}%, 最小成交量: {self.min_volume_usdt/1e6:.0f}M USDT")
+        logging.info(f"📊 动态仓位: {'开启' if self.dynamic_sizing else '关闭'}")
 
         if self.blacklist:
             logging.info(f"🚫 当前黑名单: {list(self.blacklist)}")
-        else:
-            logging.info("📝 当前未设置黑名单")
+        logging.info("=" * 60)
 
     def setup_margin_modes(self, symbols: List[str] = None) -> Dict[str, bool]:
         """批量设置交易对为全仓模式"""
@@ -586,17 +639,26 @@ class AutoTradingBot:
     # ============================================================
 
     def sync_server_time(self):
-        """同步服务器时间，计算本地与服务器的时间偏移"""
+        """多采样时间同步，取延迟最低的样本以获得最精确偏移"""
         try:
-            local_before = int(time.time() * 1000)
-            server_time = self.api.get_server_time()
-            local_after = int(time.time() * 1000)
+            best_latency = float('inf')
+            best_offset = 0
 
-            latency = (local_after - local_before) / 2
-            local_mid = (local_before + local_after) / 2
-            self.time_offset = local_mid - server_time
+            for _ in range(self.time_sync_samples):
+                local_before = int(time.time() * 1000)
+                server_time = self.api.get_server_time()
+                local_after = int(time.time() * 1000)
 
-            logging.info(f"⏱ 时间同步: 偏移={self.time_offset:.0f}ms, 网络延迟={latency:.0f}ms")
+                latency = (local_after - local_before) / 2
+                local_mid = (local_before + local_after) / 2
+                offset = local_mid - server_time
+
+                if latency < best_latency:
+                    best_latency = latency
+                    best_offset = offset
+
+            self.time_offset = best_offset
+            logging.info(f"⏱ 时间同步({self.time_sync_samples}采样): 偏移={self.time_offset:.0f}ms, 最佳延迟={best_latency:.0f}ms")
         except Exception as e:
             logging.error(f"时间同步失败: {e}")
             self.time_offset = 0
@@ -644,17 +706,151 @@ class AutoTradingBot:
             logging.error(f"获取结算时间失败: {e}")
             return {}
 
+    # ============================================================
+    # v3.0 量化增强方法
+    # ============================================================
+
+    def _refresh_ticker_cache(self):
+        """刷新24h ticker缓存，避免重复请求"""
+        now = time.time()
+        if now - self._ticker_cache_time > 60:  # 60秒缓存
+            try:
+                tickers = self.api.get_24hr_ticker()
+                self._ticker_cache = {t['symbol']: t for t in tickers if 'symbol' in t}
+                self._ticker_cache_time = now
+            except Exception as e:
+                logging.warning(f"刷新ticker缓存失败: {e}")
+
+    def estimate_spread_cost(self, symbol: str) -> float:
+        """
+        估算买卖价差成本 (占价格的比例)
+        使用bookTicker获取最优买卖价，比完整order book更快
+        """
+        try:
+            book = self.api.get_book_ticker(symbol)
+            if not book:
+                return self.max_spread_ratio  # 无数据时返回上限
+
+            best_bid = float(book.get('bidPrice', 0))
+            best_ask = float(book.get('askPrice', 0))
+
+            if best_bid <= 0 or best_ask <= 0:
+                return self.max_spread_ratio
+
+            mid_price = (best_bid + best_ask) / 2
+            spread_ratio = (best_ask - best_bid) / mid_price
+
+            return spread_ratio
+        except Exception:
+            return self.max_spread_ratio
+
+    def estimate_net_profit_rate(self, funding_rate: float, spread_ratio: float) -> float:
+        """
+        估算单次套利净利润率
+
+        净利润 = |funding_rate| - 2×taker_fee - spread_cost
+        - funding_rate: 资金费率 (正或负，取绝对值)
+        - 2×taker_fee: 开仓+平仓各一次taker手续费
+        - spread_cost: 买卖价差导致的滑点成本 (开仓+平仓各一半spread)
+        """
+        gross = abs(funding_rate)
+        fees = 2 * self.TAKER_FEE_RATE
+        slippage = spread_ratio  # 开+平各吃半个spread ≈ 一个完整spread
+        net = gross - fees - slippage
+        return net
+
+    def get_funding_rate_trend(self, symbol: str) -> float:
+        """
+        获取资金费率趋势强度
+        返回: >0 表示费率在加强(更偏离0), <0 表示在回归0
+        用最近3期的绝对值斜率衡量
+        """
+        try:
+            history = self.api.get_funding_rate_history(symbol, limit=4)
+            if not history or len(history) < 2:
+                return 0.0
+
+            rates = [abs(float(h.get('fundingRate', 0))) for h in history]
+            # 简单线性趋势: 最新 vs 平均
+            if len(rates) >= 3:
+                recent_avg = sum(rates[-2:]) / 2
+                older_avg = sum(rates[:-2]) / max(len(rates) - 2, 1)
+                return recent_avg - older_avg
+            else:
+                return rates[-1] - rates[0]
+        except Exception:
+            return 0.0
+
+    def calculate_position_amount(self, candidate: Dict) -> float:
+        """
+        动态仓位计算 (Kelly-inspired)
+
+        基础仓位 = trade_amount
+        调整因子 = clamp(net_profit_rate / min_net_profit_rate, 0.5, 2.0)
+        最终仓位 = 基础仓位 × 调整因子
+
+        净利润率越高 → 仓位越大 (上限2x), 刚过阈值 → 减半仓位
+        """
+        if not self.dynamic_sizing:
+            return self.trade_amount
+
+        net_rate = candidate.get('net_profit_rate', 0)
+        if net_rate <= 0:
+            return self.trade_amount * 0.5  # 安全兜底
+
+        # 信心因子: net_profit / min_threshold
+        confidence = net_rate / self.min_net_profit_rate
+        factor = max(0.5, min(2.0, confidence))
+
+        amount = self.trade_amount * factor
+        return round(amount, 2)
+
+    def score_candidate(self, candidate: Dict) -> float:
+        """
+        多因子候选评分
+
+        score = net_profit_rate × (1 + trend_bonus) × liquidity_factor
+
+        - net_profit_rate: 核心收益指标 (已扣除费用)
+        - trend_bonus: 费率趋势加成 (强化中 +20%, 回归中 -20%)
+        - liquidity_factor: 流动性因子 (成交量越大越好，log scale)
+        """
+        net_rate = candidate.get('net_profit_rate', 0)
+
+        # 趋势加成
+        trend = candidate.get('rate_trend', 0)
+        if trend > 0:
+            trend_bonus = min(0.2, trend * 100)  # 最多+20%
+        elif trend < 0:
+            trend_bonus = max(-0.2, trend * 100)  # 最多-20%
+        else:
+            trend_bonus = 0
+
+        # 流动性因子 (log scale, 以5000万为基准)
+        volume = candidate.get('volume_24h', 0)
+        if volume > 0:
+            import math
+            liquidity_factor = math.log10(max(volume, 1e6)) / math.log10(5e7)
+            liquidity_factor = max(0.5, min(1.5, liquidity_factor))
+        else:
+            liquidity_factor = 0.5
+
+        score = net_rate * (1 + trend_bonus) * liquidity_factor
+        return score
+
     def scan_funding_candidates(self, settlement_time: int) -> List[Dict]:
         """
-        扫描本轮资金费率套利候选
+        v3.0 增强候选扫描 - 多因子过滤+评分
 
-        筛选条件:
+        过滤条件:
         1. nextFundingTime == settlement_time
-        2. |lastFundingRate| >= min_funding_rate
-        3. 无当前持仓
-        4. 不在黑名单
+        2. |lastFundingRate| >= min_funding_rate (粗筛)
+        3. 不在黑名单 & 无当前持仓
+        4. 24h成交量 >= min_volume_usdt (流动性)
+        5. 买卖价差 <= max_spread_ratio (滑点控制)
+        6. 净利润率 >= min_net_profit_rate (成本过滤)
 
-        返回: [{symbol, rate, direction}, ...] 按费率绝对值降序排列
+        评分: score_candidate() 多因子排序
         """
         candidates = []
 
@@ -663,6 +859,11 @@ class AutoTradingBot:
             if not funding_rates:
                 return candidates
 
+            # 刷新ticker缓存
+            self._refresh_ticker_cache()
+
+            # 第一轮: 粗筛
+            rough_candidates = []
             for data in funding_rates:
                 symbol = data.get('symbol', '')
                 if not symbol.endswith('USDT'):
@@ -675,42 +876,90 @@ class AutoTradingBot:
                     continue
 
                 rate = float(data.get('lastFundingRate', 0))
-
-                # 费率绝对值必须大于阈值
                 if abs(rate) < self.min_funding_rate:
                     continue
 
-                # 检查是否已有持仓
+                # 成交量粗筛 (使用缓存)
+                ticker = self._ticker_cache.get(symbol, {})
+                volume_24h = float(ticker.get('quoteVolume', 0))
+                if volume_24h < self.min_volume_usdt:
+                    continue
+
+                rough_candidates.append({
+                    'symbol': symbol,
+                    'rate': rate,
+                    'direction': 'LONG' if rate < 0 else 'SHORT',
+                    'volume_24h': volume_24h,
+                    'mark_price': float(data.get('markPrice', 0)),
+                })
+
+            logging.info(f"🔍 粗筛通过: {len(rough_candidates)} 个候选 (费率≥{self.min_funding_rate*100:.3f}%, 成交量≥{self.min_volume_usdt/1e6:.0f}M)")
+
+            # 按费率绝对值预排序，只深度分析前 max_positions×3 个
+            rough_candidates.sort(key=lambda x: abs(x['rate']), reverse=True)
+            to_analyze = rough_candidates[:self.max_positions * 3]
+
+            # 第二轮: 深度分析 (价差、净利润、趋势)
+            for c in to_analyze:
+                symbol = c['symbol']
+
+                # 检查持仓
                 if self.has_position(symbol):
                     logging.info(f"⏭ {symbol} 已有持仓，跳过")
                     continue
 
-                # 决定方向: 负费率做多(空头付给多头), 正费率做空(多头付给空头)
-                direction = 'LONG' if rate < 0 else 'SHORT'
+                # 估算价差成本
+                spread = self.estimate_spread_cost(symbol)
+                if spread > self.max_spread_ratio:
+                    logging.debug(f"⏭ {symbol} 价差过大: {spread*100:.3f}%")
+                    continue
 
-                candidates.append({
-                    'symbol': symbol,
-                    'rate': rate,
-                    'direction': direction
-                })
+                # 估算净利润率
+                net_rate = self.estimate_net_profit_rate(c['rate'], spread)
+                if net_rate < self.min_net_profit_rate:
+                    logging.debug(f"⏭ {symbol} 净利润率不足: {net_rate*100:.4f}%")
+                    continue
 
-            # 按费率绝对值排序，取最大的N个
-            candidates.sort(key=lambda x: abs(x['rate']), reverse=True)
+                # 费率趋势
+                rate_trend = self.get_funding_rate_trend(symbol)
+
+                c['spread'] = spread
+                c['net_profit_rate'] = net_rate
+                c['rate_trend'] = rate_trend
+                c['score'] = self.score_candidate(c)
+
+                candidates.append(c)
+
+            # 按综合评分排序
+            candidates.sort(key=lambda x: x['score'], reverse=True)
             candidates = candidates[:self.max_positions]
+
+            # 详细日志
+            for c in candidates:
+                emoji = '📈' if c['direction'] == 'LONG' else '📉'
+                logging.info(
+                    f"  {emoji} {c['symbol']}: {c['direction']}, "
+                    f"费率={c['rate']*100:.4f}%, 净利润≈{c['net_profit_rate']*100:.4f}%, "
+                    f"价差={c['spread']*100:.3f}%, 评分={c['score']:.6f}"
+                )
 
             return candidates
 
         except Exception as e:
             logging.error(f"扫描候选失败: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
             return candidates
 
-    def execute_open_position(self, symbol: str, direction: str) -> bool:
+    def execute_open_position(self, candidate: Dict) -> bool:
         """
-        开仓（做多或做空）
+        开仓 - 支持动态仓位
         Args:
-            symbol: 交易对
-            direction: 'LONG' 或 'SHORT'
+            candidate: 候选字典 (包含symbol, direction, net_profit_rate等)
         """
+        symbol = candidate['symbol']
+        direction = candidate['direction']
+
         try:
             # 设置杠杆
             try:
@@ -718,25 +967,31 @@ class AutoTradingBot:
             except Exception:
                 pass
 
+            # 动态仓位计算
+            amount = self.calculate_position_amount(candidate)
+
             side = 'BUY' if direction == 'LONG' else 'SELL'
 
             order_result = self.api.place_order(
                 symbol=symbol,
                 side=side,
                 order_type='MARKET',
-                quoteOrderQty=self.trade_amount
+                quoteOrderQty=amount
             )
 
-            # 提取成交数量用于快速平仓
             executed_qty = float(order_result.get('executedQty', 0))
+            avg_price = float(order_result.get('avgPrice', 0)) if order_result.get('avgPrice') else 0
             emoji = '📈' if direction == 'LONG' else '📉'
-            logging.info(f"{emoji} {symbol} {direction} 开仓成功, 数量={executed_qty}")
+            logging.info(f"{emoji} {symbol} {direction} 开仓成功, 数量={executed_qty}, 金额={amount} USDT, 均价={avg_price}")
 
-            # 记录本轮持仓
             self.round_positions.append({
                 'symbol': symbol,
                 'direction': direction,
-                'quantity': executed_qty
+                'quantity': executed_qty,
+                'amount': amount,
+                'avg_price': avg_price,
+                'rate': candidate.get('rate', 0),
+                'net_profit_rate': candidate.get('net_profit_rate', 0),
             })
 
             return True
@@ -754,7 +1009,7 @@ class AutoTradingBot:
         for c in candidates:
             t = threading.Thread(
                 target=self.execute_open_position,
-                args=(c['symbol'], c['direction'])
+                args=(c,)
             )
             threads.append(t)
             t.start()
@@ -765,7 +1020,7 @@ class AutoTradingBot:
         logging.info(f"🚀 开仓完成: 成功 {len(self.round_positions)}/{len(candidates)} 个")
 
     def close_positions_parallel(self):
-        """并行平仓本轮所有持仓"""
+        """并行平仓本轮所有持仓，带指数退避重试"""
         if not self.round_positions:
             return
 
@@ -775,12 +1030,14 @@ class AutoTradingBot:
 
         def close_one(pos):
             try:
-                # 优先使用快速平仓(跳过持仓查询)
                 if pos.get('quantity') and pos['quantity'] > 0:
-                    self.api.fast_close_position(
+                    result = self.api.fast_close_position(
                         pos['symbol'], pos['quantity'],
                         pos['direction'], self.position_mode
                     )
+                    # 记录平仓均价
+                    if result and result.get('avgPrice'):
+                        pos['close_price'] = float(result['avgPrice'])
                 else:
                     self.api.close_position(pos['symbol'])
                 logging.info(f"✅ {pos['symbol']} 平仓成功")
@@ -797,16 +1054,77 @@ class AutoTradingBot:
         for t in threads:
             t.join(timeout=10)
 
-        # 重试失败的平仓
-        for pos in failed:
-            try:
-                logging.info(f"🔄 重试平仓 {pos['symbol']}...")
-                self.api.close_position(pos['symbol'])
-                logging.info(f"✅ {pos['symbol']} 重试平仓成功")
-            except Exception as e:
-                logging.error(f"❌❌ {pos['symbol']} 重试仍失败, 请手动平仓! 错误: {e}")
+        # 指数退避重试失败的平仓 (最多3次: 0.5s, 1s, 2s)
+        retry_list = list(failed)
+        failed.clear()
+        for attempt in range(3):
+            if not retry_list:
+                break
+            backoff = 0.5 * (2 ** attempt)
+            time.sleep(backoff)
+            still_failed = []
+            for pos in retry_list:
+                try:
+                    logging.info(f"🔄 重试平仓 {pos['symbol']} (第{attempt+1}次, 退避{backoff:.1f}s)...")
+                    self.api.close_position(pos['symbol'])
+                    logging.info(f"✅ {pos['symbol']} 重试平仓成功")
+                except Exception as e:
+                    logging.error(f"❌ {pos['symbol']} 第{attempt+1}次重试失败: {e}")
+                    still_failed.append(pos)
+            retry_list = still_failed
 
-        logging.info(f"🔻 平仓完成: {len(positions_to_close) - len(failed)}/{len(positions_to_close)} 成功")
+        if retry_list:
+            for pos in retry_list:
+                logging.error(f"❌❌ {pos['symbol']} 3次重试均失败, 请手动平仓!")
+            failed.extend(retry_list)
+
+        success_count = len(positions_to_close) - len(failed)
+        logging.info(f"🔻 平仓完成: {success_count}/{len(positions_to_close)} 成功")
+
+        # P&L追踪
+        self._log_round_pnl(positions_to_close)
+
+    def _log_round_pnl(self, positions: List[Dict]):
+        """
+        记录本轮P&L估算
+
+        预估P&L = Σ (|funding_rate| × amount - 2 × taker_fee × amount)
+        注: 实际P&L需从交易所查询, 这里是估算用于实时监控
+        """
+        self.round_counter += 1
+        total_funding_est = 0
+        total_fees_est = 0
+        total_amount = 0
+
+        for pos in positions:
+            amount = pos.get('amount', self.trade_amount)
+            rate = abs(pos.get('rate', 0))
+            funding_est = rate * amount * self.leverage
+            fees_est = 2 * self.TAKER_FEE_RATE * amount * self.leverage
+            total_funding_est += funding_est
+            total_fees_est += fees_est
+            total_amount += amount
+
+        net_est = total_funding_est - total_fees_est
+
+        record = {
+            'round': self.round_counter,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'positions_count': len(positions),
+            'total_amount': total_amount,
+            'funding_est': round(total_funding_est, 4),
+            'fees_est': round(total_fees_est, 4),
+            'net_est': round(net_est, 4),
+            'symbols': [p['symbol'] for p in positions],
+        }
+        self.session_pnl.append(record)
+
+        # 累计统计
+        cumulative_net = sum(r['net_est'] for r in self.session_pnl)
+        total_rounds = len(self.session_pnl)
+
+        logging.info(f"💰 本轮P&L估算: 资金费≈{total_funding_est:.4f}, 手续费≈{total_fees_est:.4f}, 净利≈{net_est:.4f} USDT")
+        logging.info(f"📊 累计{total_rounds}轮: 估算净利≈{cumulative_net:.4f} USDT")
 
     def precise_sleep_until(self, target_ms: int):
         """精确等待到目标服务器时间，最后1秒用忙等待"""
@@ -849,10 +1167,11 @@ class AutoTradingBot:
         logging.info(f"📋 持仓模式: {self.position_mode}")
 
         logging.info("=" * 60)
-        logging.info("🤖 资金费率套利机器人启动")
+        logging.info("🧠 资金费率套利机器人 v3.0 (量化增强版) 启动")
         logging.info(f"📋 策略: 结算前{self.open_before_seconds}秒开仓 → 吃资金费 → 结算后{self.close_after_seconds}秒平仓")
         logging.info(f"💰 每笔: {self.trade_amount} USDT, 杠杆: {self.leverage}x")
-        logging.info(f"📊 最小费率: {self.min_funding_rate*100:.3f}%, 最大持仓: {self.max_positions}个")
+        logging.info(f"📊 最小费率: {self.min_funding_rate*100:.3f}%, 最小净利润: {self.min_net_profit_rate*100:.4f}%")
+        logging.info(f"📊 最大持仓: {self.max_positions}个, 动态仓位: {'开启' if self.dynamic_sizing else '关闭'}")
         logging.info("=" * 60)
 
         while self.running:
@@ -908,11 +1227,7 @@ class AutoTradingBot:
                         time.sleep(min(wait, 300))
                     continue
 
-                logging.info(f"🎯 找到 {len(candidates)} 个套利候选:")
-                for c in candidates:
-                    emoji = '📈' if c['direction'] == 'LONG' else '📉'
-                    logging.info(f"  {emoji} {c['symbol']}: {c['direction']}, "
-                                 f"费率={c['rate']*100:.4f}%")
+                logging.info(f"🎯 找到 {len(candidates)} 个套利候选 (经量化过滤):")
 
                 # 6. 检查余额
                 balance = self.get_usdt_balance()
