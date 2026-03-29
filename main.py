@@ -505,6 +505,11 @@ class AutoTradingBot:
         self.dynamic_sizing = os.getenv('DYNAMIC_SIZING', 'true').lower() == 'true'
         self.min_volume_usdt = float(os.getenv('MIN_VOLUME_USDT', '50000000'))  # 最小24h成交量
 
+        # 止盈止损参数
+        self.take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT', '5.0'))  # 止盈百分比
+        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '5.0'))  # 止损百分比
+        self.tp_sl_check_interval = float(os.getenv('TP_SL_CHECK_INTERVAL', '1.0'))  # 检查间隔(秒)
+
         # 时间同步 (多采样)
         self.time_offset = 0
         self.time_sync_samples = 3
@@ -528,7 +533,7 @@ class AutoTradingBot:
 
         logging.info("=" * 60)
         logging.info("🧠 资金费率套利机器人 v3.0 (量化增强版) 初始化")
-        logging.info(f"📋 策略: 结算前{self.open_before_seconds}秒开仓, 结算后{self.close_after_seconds}秒平仓")
+        logging.info(f"📋 策略: 结算前{self.open_before_seconds}秒开仓, 止盈{self.take_profit_pct}%/止损{self.stop_loss_pct}%平仓")
         logging.info(f"💰 每笔: {self.trade_amount} USDT, 杠杆: {self.leverage}x")
         logging.info(f"📊 最小费率: {self.min_funding_rate*100:.3f}%, 最小净利润率: {self.min_net_profit_rate*100:.4f}%")
         logging.info(f"📊 最大价差: {self.max_spread_ratio*100:.2f}%, 最小成交量: {self.min_volume_usdt/1e6:.0f}M USDT")
@@ -1019,6 +1024,130 @@ class AutoTradingBot:
 
         logging.info(f"🚀 开仓完成: 成功 {len(self.round_positions)}/{len(candidates)} 个")
 
+    def monitor_tp_sl(self):
+        """
+        监控持仓盈亏，达到止盈或止损阈值时平仓
+
+        逻辑:
+        - 每隔 tp_sl_check_interval 秒查询一次持仓
+        - 对每个持仓计算收益率 = unRealizedProfit / amount
+        - 收益率 >= take_profit_pct% → 止盈平仓
+        - 收益率 <= -stop_loss_pct% → 止损平仓
+        - 所有持仓都平完后返回
+        """
+        if not self.round_positions:
+            return
+
+        logging.info(f"📊 进入止盈止损监控 (止盈: +{self.take_profit_pct}%, 止损: -{self.stop_loss_pct}%)")
+
+        pending = list(self.round_positions)
+        self.round_positions = []
+        closed_positions = []
+
+        while pending and self.running:
+            try:
+                positions_data = self.api.get_positions()
+            except Exception as e:
+                logging.error(f"查询持仓失败: {e}")
+                time.sleep(self.tp_sl_check_interval)
+                continue
+
+            # 建立 symbol -> position_data 的映射
+            pos_map = {}
+            for p in positions_data:
+                sym = p.get('symbol')
+                amt = float(p.get('positionAmt', 0))
+                if abs(amt) > 0.0001:
+                    pos_map[sym] = p
+
+            to_close = []
+            still_pending = []
+
+            for pos in pending:
+                symbol = pos['symbol']
+                live = pos_map.get(symbol)
+
+                if not live:
+                    # 持仓已不存在（可能被手动平了）
+                    logging.info(f"ℹ️ {symbol} 持仓已不存在，跳过")
+                    closed_positions.append(pos)
+                    continue
+
+                unrealized_pnl = float(live.get('unRealizedProfit', 0))
+                entry_price = float(live.get('entryPrice', 0))
+                mark_price = float(live.get('markPrice', 0))
+                amount = pos.get('amount', self.trade_amount)
+
+                # 计算收益率 (基于保证金, 即含杠杆的收益率)
+                if amount > 0:
+                    pnl_pct = (unrealized_pnl / amount) * 100
+                else:
+                    pnl_pct = 0
+
+                if pnl_pct >= self.take_profit_pct:
+                    logging.info(f"🎯 {symbol} 触发止盈! 收益率: {pnl_pct:+.2f}% >= +{self.take_profit_pct}% "
+                                 f"(入场: {entry_price}, 当前: {mark_price}, 盈亏: {unrealized_pnl:+.4f} USDT)")
+                    to_close.append(pos)
+                elif pnl_pct <= -self.stop_loss_pct:
+                    logging.info(f"🛑 {symbol} 触发止损! 收益率: {pnl_pct:+.2f}% <= -{self.stop_loss_pct}% "
+                                 f"(入场: {entry_price}, 当前: {mark_price}, 盈亏: {unrealized_pnl:+.4f} USDT)")
+                    to_close.append(pos)
+                else:
+                    logging.debug(f"📈 {symbol} 持仓中 收益率: {pnl_pct:+.2f}% "
+                                  f"(入场: {entry_price}, 当前: {mark_price})")
+                    still_pending.append(pos)
+
+            # 并行平仓触发的持仓
+            if to_close:
+                failed = []
+
+                def close_one(p):
+                    try:
+                        if p.get('quantity') and p['quantity'] > 0:
+                            result = self.api.fast_close_position(
+                                p['symbol'], p['quantity'],
+                                p['direction'], self.position_mode
+                            )
+                            if result and result.get('avgPrice'):
+                                p['close_price'] = float(result['avgPrice'])
+                        else:
+                            self.api.close_position(p['symbol'])
+                        logging.info(f"✅ {p['symbol']} 平仓成功")
+                    except Exception as e:
+                        logging.error(f"❌ {p['symbol']} 平仓失败: {e}")
+                        failed.append(p)
+
+                threads = []
+                for p in to_close:
+                    t = threading.Thread(target=close_one, args=(p,))
+                    threads.append(t)
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+
+                # 失败的放回 pending 等下一轮再检查
+                for p in to_close:
+                    if p not in failed:
+                        closed_positions.append(p)
+                still_pending.extend(failed)
+
+            pending = still_pending
+
+            if pending:
+                time.sleep(self.tp_sl_check_interval)
+
+        # 如果机器人停止但还有未平仓位，强制平仓
+        if pending and not self.running:
+            logging.warning(f"⚠️ 机器人停止，强制平仓剩余 {len(pending)} 个持仓")
+            self.round_positions = pending
+            self.close_positions_parallel()
+            closed_positions.extend(pending)
+        else:
+            logging.info(f"📊 止盈止损监控结束, 共平仓 {len(closed_positions)} 个")
+
+        # P&L追踪
+        self._log_round_pnl(closed_positions)
+
     def close_positions_parallel(self):
         """并行平仓本轮所有持仓，带指数退避重试"""
         if not self.round_positions:
@@ -1168,7 +1297,7 @@ class AutoTradingBot:
 
         logging.info("=" * 60)
         logging.info("🧠 资金费率套利机器人 v3.0 (量化增强版) 启动")
-        logging.info(f"📋 策略: 结算前{self.open_before_seconds}秒开仓 → 吃资金费 → 结算后{self.close_after_seconds}秒平仓")
+        logging.info(f"📋 策略: 结算前{self.open_before_seconds}秒开仓 → 止盈{self.take_profit_pct}%/止损{self.stop_loss_pct}%平仓")
         logging.info(f"💰 每笔: {self.trade_amount} USDT, 杠杆: {self.leverage}x")
         logging.info(f"📊 最小费率: {self.min_funding_rate*100:.3f}%, 最小净利润: {self.min_net_profit_rate*100:.4f}%")
         logging.info(f"📊 最大持仓: {self.max_positions}个, 动态仓位: {'开启' if self.dynamic_sizing else '关闭'}")
@@ -1257,20 +1386,15 @@ class AutoTradingBot:
                 open_elapsed = (time.time() - open_start) * 1000
                 logging.info(f"⚡ 开仓耗时: {open_elapsed:.0f}ms")
 
-                # 9. 精确等待到平仓时间(结算后0.5秒)
-                logging.info(f"⏳ 等待结算+平仓时间 "
-                             f"({datetime.fromtimestamp(close_time/1000).strftime('%H:%M:%S.%f')[:-3]})...")
-                self.precise_sleep_until(close_time)
-
-                # 10. 并行平仓!
-                close_start = time.time()
-                logging.info("🔻🔻🔻 平仓!")
-                self.close_positions_parallel()
-                close_elapsed = (time.time() - close_start) * 1000
-                logging.info(f"⚡ 平仓耗时: {close_elapsed:.0f}ms")
+                # 9. 进入止盈止损监控 (替代原来的立即平仓)
+                logging.info(f"📊 开仓完毕，进入止盈止损监控 (±{self.take_profit_pct}%)...")
+                monitor_start = time.time()
+                self.monitor_tp_sl()
+                monitor_elapsed = time.time() - monitor_start
+                logging.info(f"⏱️ 止盈止损监控持续: {monitor_elapsed:.1f}秒")
 
                 logging.info("=" * 40)
-                logging.info("✅ 本轮资金费率套利完成!")
+                logging.info("✅ 本轮交易完成!")
                 logging.info("=" * 40)
 
                 # 等待一小段时间再进入下一轮
