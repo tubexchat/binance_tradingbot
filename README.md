@@ -1,6 +1,6 @@
-# Binance AI Trading Bot
+# Binance Short Strategy Trading Bot
 
-An automated Binance Futures trading bot based on negative funding rate arbitrage strategy, featuring multi-indicator analysis and 24/7 unattended trading.
+An automated Binance Futures trading bot that opens short positions at the top of each hour on coins with negative funding rates, and takes profit when returns reach 2% or more.
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -23,56 +23,49 @@ An automated Binance Futures trading bot based on negative funding rate arbitrag
 
 ## Overview
 
-A smart trading bot designed for the Binance Futures market, primarily leveraging negative funding rate arbitrage. The bot uses comprehensive multi-indicator analysis — including funding rate, MACD, long/short ratio, and volume — to execute fully automated position opening and closing.
+This bot exploits the price drop that occurs after funding rate settlement on coins with negative funding rates. When a coin has a significantly negative funding rate with hourly settlement, arbitrageurs go long to collect funding fees. At each hour mark when the funding rate settles, these arbitrageurs close their long positions, creating selling pressure. This bot opens a short position at that moment and closes it when the profit reaches 2%.
 
 ### Key Features
 
-- **Negative Funding Rate Arbitrage**: Captures funding fee income from negative funding rates
-- **Fully Automated**: Auto-scanning, position opening/closing with zero manual intervention
-- **Multi-Indicator Analysis**: Combines MACD, long/short ratio, volume and more
-- **Risk Control**: Smart stop-loss, blacklist filtering, leverage management
+- **Hourly Short Strategy**: Opens short positions at each hour mark to capture post-settlement price drops
+- **Automatic Take Profit**: Closes positions when profit reaches >= 2%
+- **Smart Screening**: Filters for coins with negative funding rates < -0.1%
+- **Risk Control**: Blacklist filtering, leverage management
 - **Real-time Monitoring**: Complete account and position monitoring system
-- **Flexible Configuration**: Supports environment variables and command-line arguments
 - **Background Execution**: Supports nohup for persistent background operation
 
 ## Trading Strategy
 
-### Long Entry Conditions (All Must Be Met)
+### Short Entry Conditions (All Must Be Met)
 
 ```
-- Funding rate < -0.1% (negative funding rate)
-- 24h trading volume > 60M USDT
-- MACD daily slow line > 0 (daily uptrend)
-- Long/short ratio < 1 (shorts dominant)
-- 24h price change > 0 (positive daily movement)
-- Funding rate settlement interval = 1 hour (high-frequency settlement)
-- Excludes contracts with 0 funding rate
+- Funding rate < -0.1% (negative funding rate, indicating active arbitrage)
+- Current time is at the hour mark (top of the hour)
+- No existing position for the symbol
+- Not on the blacklist
 ```
 
 ### Exit Conditions
 
 ```
-Automatically closes positions when entry conditions are no longer met:
-  - Funding rate >= -0.1% (negative rate weakening or turning positive)
-  - 24h price change <= 0 (turning bearish)
-  - Funding rate settlement interval no longer 1 hour
-Independent monitoring thread checks positions every 5 minutes
-Fully automated — no manual intervention required
+- Take profit: Short position profit >= 2%
+- Stop loss: Short position loss >= 2%
+- Position check interval: 30 seconds (fast detection)
 ```
 
 ### Strategy Logic
 
-1. **Negative Funding Rate Arbitrage**: Going long during negative funding rates earns funding fee income
-2. **Multi-Indicator Screening**: Ensures selected assets have solid technicals and market structure
-3. **Risk Management**: Controls risk through leverage limits, blacklists, and other mechanisms
-4. **Dynamic Monitoring**: Real-time funding rate monitoring with timely position exits
+1. **Identify Arbitrage Targets**: Scan for coins with funding rate < -0.1%
+2. **Wait for Settlement**: The bot waits until the top of each hour (when funding settles)
+3. **Open Short**: At the hour mark, arbitrageurs close their longs, creating selling pressure — the bot shorts at this moment
+4. **Take Profit / Stop Loss**: A monitoring thread checks positions every 30 seconds, closes when profit >= 2% or loss >= 2%
 
 ## Features
 
 ### Automated Trading
 - Negative funding rate scanning and filtering
-- Multi-indicator technical analysis (MACD, long/short ratio, volume)
-- Automatic position opening and closing
+- Automatic short position opening at hour marks
+- Fast take-profit monitoring (30-second intervals)
 - Dynamic leverage and margin management
 - Blacklist filtering
 
@@ -119,9 +112,8 @@ BINANCE_API_SECRET=your_api_secret_here
 
 # Trading Parameters (Optional)
 TRADE_AMOUNT=100
-LEVERAGE=2
-MONITOR_INTERVAL=300
-POSITION_CHECK_INTERVAL=300
+LEVERAGE=20
+POSITION_CHECK_INTERVAL=30
 
 # Blacklist Settings (Optional)
 BLACKLIST_SYMBOLS=LUNAUSDT,USTCUSDT
@@ -156,25 +148,10 @@ python3 auto_trading_bot.py
 | `BINANCE_API_KEY` | - | Binance API key (required) |
 | `BINANCE_API_SECRET` | - | Binance API secret (required) |
 | `TRADE_AMOUNT` | 100 | Trade amount per order (USDT) |
-| `LEVERAGE` | 2 | Leverage multiplier |
-| `MONITOR_INTERVAL` | 300 | Monitoring interval (seconds) |
-| `POSITION_CHECK_INTERVAL` | 300 | Position check interval (seconds) |
+| `LEVERAGE` | 20 | Leverage multiplier |
+| `POSITION_CHECK_INTERVAL` | 30 | Position check interval in seconds |
 | `BLACKLIST_SYMBOLS` | - | Blacklisted trading pairs (comma-separated) |
 | `USE_TESTNET` | false | Use testnet environment |
-
-### Command-Line Arguments
-
-```bash
-python3 auto_trading_bot.py --help
-
-Options:
-  --amount AMOUNT       Trade amount in USDT (default: 100)
-  --leverage LEVERAGE   Leverage multiplier (default: 2)
-  --interval INTERVAL   Monitoring interval in seconds (default: 300)
-  --position-check-interval INTERVAL
-                        Position check interval in seconds (default: 300)
-  --testnet             Use testnet
-```
 
 ## Usage
 
@@ -194,34 +171,25 @@ Options:
 ### Option 2: Interactive Mode
 
 ```bash
-# Default parameters
 python3 auto_trading_bot.py
-
-# Custom parameters
-python3 auto_trading_bot.py --amount 50 --leverage 5
 ```
 
 ### Option 3: Background Mode
 
 ```bash
-# Run in background with nohup
 nohup python3 run_auto_trading.py > trading.log 2>&1 &
 ```
 
 ### Option 4: Account Monitoring
 
 ```bash
-# View account info
 python3 main.py
-
-# Debug position check
-python3 debug_position_check.py
 ```
 
 ## Project Structure
 
 ```
-binancebot-long-lewis/
+binance_tradingbot/
 ├── main.py                    # Core API and trading logic
 ├── auto_trading_bot.py        # Interactive startup script
 ├── run_auto_trading.py        # Background execution script
@@ -247,70 +215,16 @@ tail -f logs/trading_bot_*.log
 
 # Check process status
 ./check_bot.sh
-
-# View system processes
-ps aux | grep python3
 ```
 
 ### Log Analysis
 
 Log files contain:
-- Trading signals and decision processes
-- Position open/close records
+- Short entry signals and screening results
+- Position open/close records with profit percentages
+- Take-profit and stop-loss events
 - Account balance changes
 - Errors and exceptions
-- Performance statistics
-
-### Performance Monitoring
-
-```bash
-# View account summary
-python3 main.py
-
-# Get position info
-python3 -c "from main import BinanceAccountMonitor; m = BinanceAccountMonitor(); m.print_positions()"
-```
-
-## API Reference
-
-### BinanceFuturesAPI
-
-```python
-from main import BinanceFuturesAPI
-
-# Initialize API
-api = BinanceFuturesAPI()
-
-# Account information
-account = api.get_account_info()
-positions = api.get_positions()
-balance = api.get_balance()
-
-# Trading operations
-api.place_order(symbol='BTCUSDT', side='BUY', order_type='MARKET', quoteOrderQty=100)
-api.close_position('BTCUSDT')
-api.set_leverage('BTCUSDT', 5)
-
-# Market data
-funding_rates = api.get_funding_rates()
-klines = api.get_klines('BTCUSDT', '1d')
-```
-
-### AutoTradingBot
-
-```python
-from main import AutoTradingBot
-
-# Initialize trading bot
-bot = AutoTradingBot()
-
-# Set trading parameters
-bot.trade_amount = 100
-bot.leverage = 5
-
-# Start monitoring
-bot.start_monitoring()
-```
 
 ## Risk Disclaimer
 
@@ -318,8 +232,8 @@ bot.start_monitoring()
 
 - **Market Risk**: Futures trading involves significant price volatility
 - **Leverage Risk**: Leveraged trading amplifies both gains and losses
-- **Funding Rate Risk**: Funding rates can change rapidly
-- **Technical Risk**: Indicator failures or network issues may occur
+- **Strategy Risk**: The price may not drop after settlement; arbitrageurs may not close positions as expected
+- **Technical Risk**: Network issues or API failures may prevent timely order execution
 
 ### Recommendations
 
@@ -339,43 +253,21 @@ This project is for educational and research purposes only and does not constitu
 
 1. **API Connection Failed**
    ```bash
-   # Check API key configuration
-   cat .env | grep BINANCE_API
-
-   # Test API connection
    python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); print(api.get_account_info())"
    ```
 
 2. **Margin Mode Error**
    ```bash
-   # Re-run margin mode setup
    python3 setup_margin_modes.py
    ```
 
 3. **Bot Startup Failed**
    ```bash
-   # View detailed logs
    tail -50 logs/trading_bot_*.log
-
-   # Check process status
    ./check_bot.sh
    ```
 
 4. **Permission Issues**
    ```bash
-   # Add execute permissions
    chmod +x *.sh
    ```
-
-### Debug Commands
-
-```bash
-# Test API connection
-python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); print('API connection successful')"
-
-# Check blacklist configuration
-python3 -c "from main import AutoTradingBot; bot = AutoTradingBot(); bot.debug_blacklist()"
-
-# View funding rates
-python3 -c "from main import BinanceFuturesAPI; api = BinanceFuturesAPI(); api.debug_funding_rates()"
-```

@@ -415,31 +415,30 @@ class BinanceFuturesAPI:
         return self._make_request('GET', '/fapi/v1/ticker/24hr', signed=False)
 
 class AutoTradingBot:
-    """自动化交易机器人"""
-    
+    """自动化交易机器人 - 整点做空策略"""
+
     def __init__(self, api_key: str = None, api_secret: str = None, testnet: bool = False):
         """初始化自动化交易机器人"""
         self.api = BinanceFuturesAPI(api_key, api_secret, testnet)
         self.running = False
-        
-        # 交易参数（按README.md要求设置）
+
+        # 交易参数
         self.trade_amount = 100  # 每次交易金额(USDT)
         self.leverage = 20  # 杠杆倍数
-        self.funding_rate_min = -0.02  # 资金费率下限(-2%)
-        self.funding_rate_max = -0.001  # 资金费率上限(-0.1%)
-        self.min_volume_usdt = 60000000  # 最小24小时交易量(6000万USDT)
-        self.monitor_interval = 300  # 监控间隔(5分钟)
-        self.position_check_interval = 300  # 持仓检查间隔(5分钟)
+        self.take_profit_pct = 0.02  # 止盈百分比(2%)
+        self.stop_loss_pct = -0.02  # 止损百分比(-2%)
+        self.funding_rate_threshold = -0.001  # 资金费率阈值(-0.1%)
+        self.position_check_interval = 30  # 持仓检查间隔(30秒，需要快速检测止盈)
         self.position_monitor_thread = None  # 持仓监控线程
-        
-        # 做多候选列表
-        self.long_candidates = set()
-        
+
+        # 做空候选列表
+        self.short_candidates = set()
+
         # 黑名单设置
         self.load_blacklist()
-        
-        logging.info("自动化交易机器人初始化完成 - 基于1小时资金费率结算+无持仓+负资金费率的做多策略")
-        
+
+        logging.info("自动化交易机器人初始化完成 - 整点做空策略(等待套利者平仓后开空，止盈2%/止损-2%)")
+
         # 显示当前黑名单状态
         if self.blacklist:
             logging.info(f"🚫 当前黑名单: {list(self.blacklist)}")
@@ -575,64 +574,55 @@ class AutoTradingBot:
             logging.debug(f"检查 {symbol} 1小时资金费率结算失败: {e}")
             return False
 
-    def get_long_candidates(self) -> List[str]:
+    def get_short_candidates(self) -> List[str]:
         """
-        获取做多候选合约列表
+        获取做空候选合约列表
         筛选条件：
-        1. 资金费率结算时间为1小时
+        1. 资金费率结算时间为1小时（有人在套利的标志）
         2. 当前没有持仓
-        3. 资金费率小于-0.1%
+        3. 资金费率小于-0.1%（负资金费率，说明有大量套利者做多）
         """
         candidates = []
 
         try:
-            # 获取所有合约的资金费率
-            logging.info("开始筛选做多候选合约...")
+            logging.info("开始筛选做空候选合约...")
             funding_rates = self.api.get_funding_rates()
             if not funding_rates:
                 logging.warning("未能获取资金费率数据")
                 return candidates
 
-            # 筛选符合条件的合约
             for data in funding_rates:
                 try:
                     symbol = data.get('symbol', '')
                     if not symbol.endswith('USDT'):
                         continue
 
-                    # 检查黑名单
                     if symbol in self.blacklist:
-                        logging.debug(f"❌ {symbol} 在黑名单中，跳过做多")
+                        logging.debug(f"❌ {symbol} 在黑名单中，跳过")
                         continue
 
-                    # 筛选条件1：资金费率结算时间为1小时
-                    if not self.check_hourly_funding(symbol):
-                        logging.debug(f"{symbol} 资金费率结算时间不是1小时，跳过做多")
-                        continue
-
-                    # 筛选条件2：当前没有持仓
+                    # 条件1：无持仓
                     if self.has_position(symbol):
-                        logging.debug(f"{symbol} 已有持仓，跳过做多")
+                        logging.debug(f"{symbol} 已有持仓，跳过")
                         continue
 
-                    # 筛选条件3：资金费率小于-0.1%
+                    # 条件2：负资金费率 < -0.1%
                     funding_rate = float(data.get('lastFundingRate', 0))
-                    if funding_rate >= -0.001:  # -0.1%
-                        logging.debug(f"{symbol} 资金费率 {funding_rate:.6f} >= -0.1%，跳过做多")
+                    if funding_rate >= self.funding_rate_threshold:
                         continue
 
                     candidates.append(symbol)
-                    logging.info(f"✅ 做多候选: {symbol}, 1小时结算: ✓, 无持仓: ✓, 资金费率: {funding_rate:.6f}")
+                    logging.info(f"✅ 做空候选: {symbol}, 无持仓: ✓, 资金费率: {funding_rate:.6f}")
 
                 except Exception as e:
                     logging.error(f"处理合约 {symbol} 时出错: {e}")
                     continue
 
-            logging.info(f"筛选完成，共找到 {len(candidates)} 个做多候选合约")
+            logging.info(f"筛选完成，共找到 {len(candidates)} 个做空候选合约")
             return candidates
 
         except Exception as e:
-            logging.error(f"获取做多候选合约失败: {e}")
+            logging.error(f"获取做空候选合约失败: {e}")
             return candidates
 
     def get_usdt_balance(self) -> float:
@@ -678,235 +668,215 @@ class AutoTradingBot:
             # 出错时保守处理，返回True以避免重复下单
             return True
 
-    def execute_buy_order(self, symbol: str) -> bool:
-        """执行买入订单（做多）"""
+    def execute_short_order(self, symbol: str) -> bool:
+        """执行做空订单"""
         try:
-            # 黑名单安全检查：再次确认不在黑名单中
             if symbol in self.blacklist:
-                logging.warning(f"🚫 {symbol} 在黑名单中，禁止做多操作")
+                logging.warning(f"🚫 {symbol} 在黑名单中，禁止做空操作")
                 return False
-            
-            # 安全检查：再次确认是否已有持仓
+
             if self.has_position(symbol):
-                logging.warning(f"🚫 {symbol} 已有持仓，取消做多操作")
+                logging.warning(f"🚫 {symbol} 已有持仓，取消做空操作")
                 return False
-            
-            # 检查余额
+
             balance = self.get_usdt_balance()
             if balance < self.trade_amount:
                 logging.warning(f"USDT余额不足: {balance} < {self.trade_amount}")
                 return False
-            
-            # 设置杠杆倍数
+
+            # 设置杠杆
             try:
                 self.api.set_leverage(symbol, self.leverage)
                 logging.info(f"✅ {symbol} 杠杆设置为 {self.leverage}x")
             except Exception as e:
                 logging.warning(f"设置杠杆可能失败: {e}")
-            
-            # 注意：保证金模式应在机器人启动前手动设置为全仓模式
-            # 如果有持仓，币安不允许程序化更改保证金模式
-            # 请确保所有交易对都已设置为全仓(CROSSED)模式
-            
-            # 下市价买单（做多）
+
+            # 下市价卖单（做空）
             order_result = self.api.place_order(
                 symbol=symbol,
-                side='BUY',
+                side='SELL',
                 order_type='MARKET',
                 quoteOrderQty=self.trade_amount
             )
-            
-            logging.info(f"📈 成功做多 {symbol}: {order_result}")
-            
-            # 等待一小段时间让订单生效
-            import time
+
+            logging.info(f"📉 成功做空 {symbol}: {order_result}")
+
             time.sleep(2)
-            
-            # 验证持仓是否已经建立
+
             if self.has_position(symbol):
-                logging.info(f"✅ {symbol} 做多订单已确认，持仓已建立")
+                logging.info(f"✅ {symbol} 做空订单已确认，持仓已建立")
             else:
-                logging.warning(f"⚠️ {symbol} 做多订单已执行，但未检测到持仓（可能需要更多时间同步）")
-            
+                logging.warning(f"⚠️ {symbol} 做空订单已执行，但未检测到持仓（可能需要更多时间同步）")
+
             return True
-            
+
         except Exception as e:
-            logging.error(f"执行 {symbol} 做多订单失败: {e}")
+            logging.error(f"执行 {symbol} 做空订单失败: {e}")
             return False
 
-    def check_position_conditions(self, symbol: str) -> tuple[bool, str]:
-        """
-        检查持仓合约是否符合交易条件
-        返回: (是否符合条件, 不符合的原因)
-        """
-        try:
-            # 获取当前资金费率
-            funding_data = self.api.get_symbol_funding_rate(symbol)
-            if not funding_data:
-                return False, "无法获取资金费率数据"
-
-            funding_rate = float(funding_data.get('lastFundingRate', 0))
-
-            # 唯一条件：资金费率必须小于等于-0.1%
-            if funding_rate > -0.001:  # -0.1%
-                return False, f"资金费率不符合({funding_rate:.6f} > -0.1%)"
-
-            return True, "符合条件"
-
-        except Exception as e:
-            return False, f"检查条件时出错: {e}"
-
     def check_and_close_positions(self):
-        """检查并平仓（新策略：当持仓合约不符合条件时自动平仓）"""
+        """检查空头持仓，止盈2%或止损-2%"""
         try:
-            logging.info("开始检查需要平仓的持仓...")
-
-            # 获取所有持仓
             positions = self.api.get_positions()
             if not positions:
-                logging.debug("未获取到持仓信息")
                 return
 
-            # 过滤有效持仓
-            active_positions = []
-            for position in positions:
-                position_amt = float(position.get('positionAmt', 0))
-                if abs(position_amt) > 0:
-                    active_positions.append(position)
+            active_positions = [p for p in positions if abs(float(p.get('positionAmt', 0))) > 0]
 
             if not active_positions:
-                logging.debug("当前没有持仓")
                 return
 
-            logging.info(f"当前有 {len(active_positions)} 个持仓")
-
-            # 检查每个持仓是否符合条件
             for position in active_positions:
                 try:
                     symbol = position.get('symbol', '')
                     position_amt = float(position.get('positionAmt', 0))
                     unrealized_pnl = float(position.get('unRealizedProfit', 0))
+                    entry_price = float(position.get('entryPrice', 0))
+                    mark_price = float(position.get('markPrice', 0))
 
-                    logging.info(f"{symbol} 持仓量: {position_amt}, 未实现盈亏: {unrealized_pnl:.4f} USDT")
-
-                    # 📝 只检查多头仓位，跳过空头仓位
-                    if position_amt < 0:
-                        logging.info(f"🔴 {symbol} 为空头仓位，跳过检查")
+                    # 只处理空头仓位
+                    if position_amt >= 0:
                         continue
 
-                    # 检查持仓合约是否符合交易条件
-                    is_valid, reason = self.check_position_conditions(symbol)
+                    # 计算收益率：空头收益 = (开仓价 - 当前价) / 开仓价
+                    if entry_price > 0:
+                        profit_pct = (entry_price - mark_price) / entry_price
+                    else:
+                        profit_pct = 0
 
-                    if not is_valid:
-                        logging.warning(f"🚨 {symbol} 不符合持仓条件: {reason}，准备平仓")
+                    logging.info(f"📊 {symbol} 空头持仓 | 开仓价: {entry_price:.6f} | 当前价: {mark_price:.6f} | 收益率: {profit_pct*100:.2f}% | 未实现盈亏: {unrealized_pnl:.4f} USDT")
 
-                        # 检查是否在黑名单中
-                        if symbol in self.blacklist:
-                            logging.warning(f"🚨 {symbol} 在黑名单中且不符合条件，强制平仓")
-
+                    # 止盈条件：收益 >= 2%
+                    if profit_pct >= self.take_profit_pct:
+                        logging.info(f"🎯 {symbol} 达到止盈目标 {profit_pct*100:.2f}% >= {self.take_profit_pct*100:.0f}%，准备平仓")
                         try:
                             result = self.api.close_position(symbol)
-                            logging.info(f"✅ 成功平仓 {symbol}: {result}")
-
-                            # 记录平仓信息
-                            logging.info(f"📊 平仓详情 - 交易对: {symbol}, 持仓量: {position_amt}, 未实现盈亏: {unrealized_pnl:.4f} USDT, 平仓原因: {reason}")
-
+                            logging.info(f"✅ 止盈平仓成功 {symbol}: {result}")
+                            logging.info(f"📊 平仓详情 - 交易对: {symbol}, 持仓量: {position_amt}, 收益率: {profit_pct*100:.2f}%, 未实现盈亏: {unrealized_pnl:.4f} USDT")
                         except Exception as e:
                             logging.error(f"❌ 平仓 {symbol} 失败: {e}")
-                    else:
-                        logging.debug(f"{symbol} 符合持仓条件，保持持仓")
+
+                    # 止损条件：亏损 <= -2%
+                    elif profit_pct <= self.stop_loss_pct:
+                        logging.warning(f"🛑 {symbol} 触发止损 {profit_pct*100:.2f}% <= {self.stop_loss_pct*100:.0f}%，准备平仓")
+                        try:
+                            result = self.api.close_position(symbol)
+                            logging.info(f"✅ 止损平仓成功 {symbol}: {result}")
+                            logging.info(f"📊 平仓详情 - 交易对: {symbol}, 持仓量: {position_amt}, 收益率: {profit_pct*100:.2f}%, 未实现盈亏: {unrealized_pnl:.4f} USDT")
+                        except Exception as e:
+                            logging.error(f"❌ 平仓 {symbol} 失败: {e}")
 
                 except Exception as e:
-                    logging.error(f"处理持仓 {symbol} 时出错: {e}")
+                    logging.error(f"处理持仓 {position.get('symbol', '')} 时出错: {e}")
                     continue
 
         except Exception as e:
             logging.error(f"检查和平仓过程失败: {e}")
 
     def scan_and_trade(self):
-        """扫描并执行做多交易（基于1小时资金费率结算+无持仓+负资金费率策略）"""
+        """在整点时扫描并执行做空交易"""
         try:
-            logging.info("开始基于1小时资金费率结算+无持仓+负资金费率策略扫描做多交易机会...")
-            
-            # 获取做多候选合约
-            current_candidates = self.get_long_candidates()
+            logging.info("开始扫描做空交易机会...")
+
+            # 获取做空候选合约
+            current_candidates = self.get_short_candidates()
             if not current_candidates:
-                logging.info("本轮扫描未发现符合条件的做多候选合约")
-                self.long_candidates = set()
+                logging.info("本轮扫描未发现符合条件的做空候选合约")
+                self.short_candidates = set()
                 return
-            
-            # 更新候选列表
-            self.long_candidates = set(current_candidates)
-            logging.info(f"当前做多候选列表: {list(self.long_candidates)}")
-            
-            # 检查每个候选合约的持仓情况
+
+            self.short_candidates = set(current_candidates)
+            logging.info(f"当前做空候选列表: {list(self.short_candidates)}")
+
             for symbol in current_candidates:
                 try:
-                    # 如果已有持仓，跳过
                     if self.has_position(symbol):
-                        logging.info(f"⚠️ {symbol} 已有持仓，跳过做多操作")
+                        logging.info(f"⚠️ {symbol} 已有持仓，跳过做空操作")
                         continue
-                    
-                    # 执行做多
-                    if self.execute_buy_order(symbol):
-                        logging.info(f"✅ 成功做多 {symbol}")
-                        # 为了避免过度交易，每次只执行一个交易
+
+                    if self.execute_short_order(symbol):
+                        logging.info(f"✅ 成功做空 {symbol}")
                         return
                     else:
-                        logging.warning(f"❌ {symbol} 做多失败")
-                        
+                        logging.warning(f"❌ {symbol} 做空失败")
+
                 except Exception as e:
-                    logging.error(f"处理做多合约 {symbol} 时出错: {e}")
+                    logging.error(f"处理做空合约 {symbol} 时出错: {e}")
                     continue
-                    
-            logging.info("本轮扫描完成，未执行新的做多交易")
-                    
+
+            logging.info("本轮扫描完成，未执行新的做空交易")
+
         except Exception as e:
             logging.error(f"扫描和交易过程失败: {e}")
 
     def position_monitor_loop(self):
-        """持仓监控循环 - 独立线程运行"""
+        """持仓监控循环 - 独立线程运行，快速检测止盈"""
         logging.info(f"🔍 持仓监控线程启动，检查间隔: {self.position_check_interval}秒")
-        
+
         while self.running:
             try:
-                # 每5分钟检查一次持仓情况
                 self.check_and_close_positions()
-                
-                if self.running:  # 检查是否仍在运行
+                if self.running:
                     time.sleep(self.position_check_interval)
-                    
             except Exception as e:
                 logging.error(f"持仓监控出错: {e}")
-                time.sleep(60)  # 出错后等待1分钟再继续
-                
+                time.sleep(10)
+
         logging.info("持仓监控线程已停止")
 
+    def _wait_until_next_hour(self):
+        """等待到下一个整点，返回False表示机器人已停止"""
+        from datetime import timedelta
+        now = datetime.now()
+        seconds_to_next_hour = 3600 - (now.minute * 60 + now.second)
+        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+        logging.info(f"⏰ 当前时间: {now.strftime('%H:%M:%S')}，等待到下一个整点 {next_hour.strftime('%H:%M')}（还需 {seconds_to_next_hour} 秒）")
+
+        # 分段等待，每30秒检查一次是否需要停止
+        waited = 0
+        while waited < seconds_to_next_hour and self.running:
+            sleep_time = min(30, seconds_to_next_hour - waited)
+            time.sleep(sleep_time)
+            waited += sleep_time
+
+        return self.running
+
     def start_monitoring(self):
-        """开始监控"""
+        """开始监控 - 在每个整点执行做空交易"""
         self.running = True
-        logging.info(f"🤖 自动化交易机器人开始运行，监控间隔: {self.monitor_interval}秒")
-        
-        # 启动独立的持仓监控线程
+        logging.info("🤖 整点做空策略机器人开始运行")
+        logging.info(f"📋 策略: 整点开空 → 止盈2%/止损-2%")
+        logging.info(f"💰 交易金额: {self.trade_amount} USDT | 杠杆: {self.leverage}x | 止盈: {self.take_profit_pct*100:.0f}% | 止损: {self.stop_loss_pct*100:.0f}%")
+
+        # 启动持仓监控线程（用于止盈检测）
         self.position_monitor_thread = threading.Thread(target=self.position_monitor_loop, daemon=True)
         self.position_monitor_thread.start()
-        logging.info("✅ 持仓监控线程已启动")
-        
+        logging.info("✅ 持仓止盈监控线程已启动")
+
         while self.running:
             try:
+                # 检查当前是否接近整点（在整点前后2分钟内则立即执行）
+                now = datetime.now()
+                if now.minute <= 2 or now.minute >= 58:
+                    logging.info(f"🕐 接近整点，立即执行做空扫描")
+                    self.scan_and_trade()
+
+                # 等待到下一个整点
+                if not self._wait_until_next_hour():
+                    break
+
+                # 整点到达，执行做空扫描
+                logging.info(f"🕐 整点到达: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 self.scan_and_trade()
-                
-                if self.running:  # 检查是否仍在运行
-                    logging.info(f"⏰ 等待 {self.monitor_interval} 秒后进行下次扫描...")
-                    time.sleep(self.monitor_interval)
-                    
+
             except KeyboardInterrupt:
                 logging.info("接收到停止信号")
                 break
             except Exception as e:
                 logging.error(f"监控过程出错: {e}")
-                time.sleep(60)  # 出错后等待1分钟再继续
-                
+                time.sleep(60)
+
         logging.info("自动化交易机器人已停止")
 
     def stop_monitoring(self):
@@ -1613,11 +1583,11 @@ def main():
                 limit = int(limit) if limit.isdigit() else 5
                 monitor.api.debug_funding_rates(limit)
             elif choice == '11':
-                print("\n🤖 自动化交易机器人")
+                print("\n🤖 整点做空策略机器人")
                 print("=" * 40)
                 print("📋 交易策略:")
-                print("🟢 做多信号: 资金费率结算时间为1小时 + 当前没有持仓 + 资金费率<-0.1%")
-                print("🔴 平仓信号: 资金费率大于-0.1%")
+                print("🔴 做空信号: 整点时 + 负资金费率<-0.1% + 无持仓")
+                print("🟢 止盈: 空头收益 >= 2% | 🛑 止损: 亏损 >= 2%")
                 print()
                 print("⚠️  警告: 自动化交易机器人将使用真实资金进行交易!")
                 print("确保您已经:")
@@ -1628,32 +1598,26 @@ def main():
                 confirm = input("\n是否确认启动自动化交易机器人? (输入 'YES' 确认): ").strip()
                 if confirm == 'YES':
                     # 获取用户自定义参数
-                    trade_amount = input("请输入每次交易金额(USDT，默认30): ").strip()
-                    trade_amount = float(trade_amount) if trade_amount.replace('.', '').isdigit() else 30
-                    
-                    leverage = input("请输入杠杆倍数(默认2): ").strip()
-                    leverage = int(leverage) if leverage.isdigit() else 2
-                    
-                    funding_threshold = input("请输入资金费率阈值(默认-0.001): ").strip()
-                    funding_threshold = float(funding_threshold) if funding_threshold.replace('-', '').replace('.', '').isdigit() else -0.001
-                    
-                    monitor_interval = input("请输入监控间隔(秒，默认300): ").strip()
-                    monitor_interval = int(monitor_interval) if monitor_interval.isdigit() else 300
-                    
-                    print("\n🤖 正在启动自动化交易机器人...")
+                    trade_amount = input("请输入每次交易金额(USDT，默认100): ").strip()
+                    trade_amount = float(trade_amount) if trade_amount.replace('.', '').isdigit() else 100
+
+                    leverage = input("请输入杠杆倍数(默认20): ").strip()
+                    leverage = int(leverage) if leverage.isdigit() else 20
+
+                    take_profit = input("请输入止盈百分比(默认2，即2%): ").strip()
+                    take_profit = float(take_profit) / 100 if take_profit.replace('.', '').isdigit() else 0.02
+
+                    print("\n🤖 正在启动整点做空策略机器人...")
                     print(f"交易金额: {trade_amount} USDT")
                     print(f"杠杆倍数: {leverage}x")
-                    print(f"资金费率阈值: {funding_threshold}")
-                    print(f"监控间隔: {monitor_interval}秒")
+                    print(f"止盈比例: {take_profit*100:.0f}%")
                     print("按 Ctrl+C 停止机器人\n")
-                    
+
                     try:
-                        # 初始化自动化交易机器人
                         bot = AutoTradingBot()
                         bot.trade_amount = trade_amount
                         bot.leverage = leverage
-                        # 注意：新策略不再需要funding_rate_threshold，直接使用负资金费率
-                        bot.monitor_interval = monitor_interval
+                        bot.take_profit_pct = take_profit
                         
                         # 开始监控
                         bot.start_monitoring()
